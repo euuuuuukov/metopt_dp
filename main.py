@@ -1,40 +1,57 @@
-start_zb1, start_zb2, start_dep = 100, 800, 400
-start_free = 600
+"""
+Основная программа для решения задачи управления инвестиционным портфелем.
+Использует метод динамического программирования (рекуррентные соотношения Беллмана).
+"""
 
-change_zb1, change_zb2, change_dep = 25, 200, 100
+from InvestmentManager import InvestmentManager
 
-steps = {
-    1: {
-        1: {
-            'p': 0.6, 'zb1': 1.2, 'zb2': 1.1, 'dep': 1.07
-        },
-        0: {
-            'p': 0.3, 'zb1': 1.05, 'zb2': 1.02, 'dep': 1.03
-        },
-        -1: {
-            'p': 0.1, 'zb1': 0.8, 'zb2': 0.95, 'dep': 1
-        }
-    },
-    2: {
-        1: {
-            'p': 0.3, 'zb1': 1.4, 'zb2': 1.15, 'dep': 1.01
-        },
-        0: {
-            'p': 0.2, 'zb1': 1.05, 'zb2': 1, 'dep': 1
-        },
-        -1: {
-            'p': 0.5, 'zb1': 0.6, 'zb2': 0.9, 'dep': 1
-        }
-    },
-    3: {
-        1: {
-            'p': 0.4, 'zb1': 1.15, 'zb2': 1.12, 'dep': 1.05
-        },
-        0: {
-            'p': 0.4, 'zb1': 1.05, 'zb2': 1.01, 'dep': 1.01
-        },
-        -1: {
-            'p': 0.2, 'zb1': 0.7, 'zb2': 0.94, 'dep': 1
-        }
-    },
-}
+
+def main():
+    """Основная функция программы."""
+    manager = InvestmentManager()
+
+    # Симулируем оптимальный путь
+    result = manager.simulate_optimal_path()
+
+    print(f"ОПТИМАЛЬНАЯ ТРАЕКТОРИЯ (математическое ожидание):")
+
+    states = result['states']
+    controls = result['controls']
+    commissions = result['commissions']
+
+    for i in range(3):
+        print(f"\nЭТАП {i + 1}:")
+        print(f"  Начало: ЦБ1={states[i]['zb1']:8.2f}, "
+              f"ЦБ2={states[i]['zb2']:8.2f}, Деп={states[i]['dep']:8.2f}, "
+              f"Свободные={states[i]['free']:8.2f}")
+
+        print(f"  Управление: ΔЦБ1={controls[i][0]:+8.2f}, "
+              f"ΔЦБ2={controls[i][1]:+8.2f}, ΔДеп={controls[i][2]:+8.2f}")
+
+        if commissions[i] > 0:
+            print(f"  Комиссия: {commissions[i]:.2f}")
+
+        print(f"  После ситуации: ЦБ1={states[i + 1]['zb1']:8.2f}, "
+              f"ЦБ2={states[i + 1]['zb2']:8.2f}, "
+              f"Деп={states[i + 1]['dep']:8.2f}, "
+              f"Свободные={states[i + 1]['free']:8.2f}")
+
+    final_state = states[-1]
+    print(f"\nФИНАЛЬНОЕ СОСТОЯНИЕ ПОРТФЕЛЯ:")
+    print(f"  ЦБ1: {final_state['zb1']:10.2f} "
+          f"(минимально допустимо: {manager.zb1.min_amount:.2f})")
+    print(f"  ЦБ2: {final_state['zb2']:10.2f} "
+          f"(минимально допустимо: {manager.zb2.min_amount:.2f})")
+    print(f"  Депозит: {final_state['dep']:7.2f} "
+          f"(минимально допустимо: {manager.dep.min_amount:.2f})")
+    print(f"  Свободные средства: {final_state['free']:7.2f}")
+
+    total_final = (final_state['zb1'] + final_state['zb2'] +
+                   final_state['dep'] + final_state['free'])
+    print(f"  ОБЩАЯ СУММА: {total_final:10.2f}")
+ 
+    print(f"\nОБЩАЯ КОМИССИЯ ЗА ВСЕ ЭТАПЫ: {sum(commissions):.2f}")
+
+
+if __name__ == "__main__":
+    main()
