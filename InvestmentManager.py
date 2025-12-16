@@ -1,371 +1,285 @@
 """
-Класс InvestmentManager реализует метод динамического программирования
-для решения задачи управления инвестиционным портфелем.
-Использует рекуррентные соотношения Беллмана (обратный ход).
+InvestmentManager
+
+ДП (Беллман) для управления портфелем на 3 этапах.
+
+Деньги храним в копейках (int), чтобы не ловить ошибки округления.
+
+solve() строит policy только для достижимых состояний (ветви ситуаций).
+
+simulate_expected_path() строит "среднюю" траекторию (по матожиданию множителей),
+поэтому промежуточные состояния могут оказаться недостижимыми.
 """
 
-from functools import lru_cache
-from typing import Tuple, List, Dict
+from typing import Tuple, Dict, List, Set
+
 from problem import (
-    START_ZB1, START_ZB2, START_DEP,
-    START_FREE, CHANGE_ZB1, CHANGE_ZB2, CHANGE_DEP,
+    START_ZB1, START_ZB2, START_DEP, START_FREE,
+    CHANGE_ZB1, CHANGE_ZB2, CHANGE_DEP,
     MIN_ZB1, MIN_ZB2, MIN_DEP,
     COMMISSION_ZB1, COMMISSION_ZB2, COMMISSION_DEP,
     STAGES
 )
-from Asset import Asset
+
+State = Tuple[int, int, int, int]     # (zb1, zb2, dep, free) in cents
+Control = Tuple[int, int, int]        # (dzb1, dzb2, ddep) in cents
 
 
 class InvestmentManager:
-    """Управляет инвестиционным портфелем и ищет оптимальную стратегию."""
+    def __init__(self) -> None:
+        self.start_state: State = (
+            int(START_ZB1 * 100),
+            int(START_ZB2 * 100),
+            int(START_DEP * 100),
+            int(START_FREE * 100),
+        )
 
-    def __init__(self):
-        """Инициализация с данными из problem.py"""
-        # Создаем активы
-        self.zb1 = Asset('ЦБ1', START_ZB1, CHANGE_ZB1, MIN_ZB1, COMMISSION_ZB1)
-        self.zb2 = Asset('ЦБ2', START_ZB2, CHANGE_ZB2, MIN_ZB2, COMMISSION_ZB2)
-        self.dep = Asset('Депозит', START_DEP, CHANGE_DEP, MIN_DEP, COMMISSION_DEP)
+        self.step_zb1 = int(CHANGE_ZB1 * 100)
+        self.step_zb2 = int(CHANGE_ZB2 * 100)
+        self.step_dep = int(CHANGE_DEP * 100)
 
-        self.free_cash = START_FREE
-        self.stages = STAGES
+        self.min_zb1 = int(MIN_ZB1 * 100)
+        self.min_zb2 = int(MIN_ZB2 * 100)
+        self.min_dep = int(MIN_DEP * 100)
 
-        # Для хранения оптимальной политики
-        self.optimal_policy = {}
+        self.c_zb1 = float(COMMISSION_ZB1)
+        self.c_zb2 = float(COMMISSION_ZB2)
+        self.c_dep = float(COMMISSION_DEP)
 
-    def _calculate_total_commission(self, delta_zb1: float, delta_zb2: float,
-                                    delta_dep: float) -> float:
-        """Рассчитывает общую комиссию за все операции"""
-        return (self.zb1.calculate_commission(delta_zb1) +
-                self.zb2.calculate_commission(delta_zb2) +
-                self.dep.calculate_commission(delta_dep))
+        self.stages = self._prepare_stages(STAGES)
 
-    def _discretize_state(self, zb1_val: float, zb2_val: float, dep_val: float,
-                          free_val: float) -> Tuple:
-        """
-        Дискретизация состояния для уменьшения пространства состояний.
-        Округляем значения до ближайших кратных шагам.
-        """
-        # Определяем шаги дискретизации
-        disc_step_zb1 = max(5, self.zb1.step / 2)
-        disc_step_zb2 = max(20, self.zb2.step / 2)
-        disc_step_dep = max(10, self.dep.step / 2)
-        disc_step_free = max(10, min(self.zb1.step, self.zb2.step, self.dep.step) / 2)
+        self.dp: Dict[int, Dict[State, float]] = {}
+        self.policy: Dict[int, Dict[State, Control]] = {}
+        self.reachable: Dict[int, Set[State]] = {}
+
+        # маленький кэш для snap, чтобы не искать каждый раз заново
+        self._snap_cache: Dict[Tuple[int, State], State] = {}
+
+    @staticmethod
+    def _prepare_stages(raw: Dict) -> Dict[int, List[Dict]]:
+        stages: Dict[int, List[Dict]] = {}
+        for k, situations in raw.items():
+            stages[k] = []
+            for s in situations.values():
+                stages[k].append({
+                    "p": float(s["p"]),
+                    "zb1": int(round(float(s["zb1"]) * 100)),
+                    "zb2": int(round(float(s["zb2"]) * 100)),
+                    "dep": int(round(float(s["dep"]) * 100)),
+                })
+        return stages
+
+    def _commission(self, dz1: int, dz2: int, dd: int) -> int:
+        return (
+            int(round(abs(dz1) * self.c_zb1)) +
+            int(round(abs(dz2) * self.c_zb2)) +
+            int(round(abs(dd) * self.c_dep))
+        )
+
+    def _quantize(self, state: State) -> State:
+        z1, z2, d, f = state
+
+        def q(x: int, step: int) -> int:
+            return (x // step) * step
 
         return (
-            round(zb1_val / disc_step_zb1) * disc_step_zb1,
-            round(zb2_val / disc_step_zb2) * disc_step_zb2,
-            round(dep_val / disc_step_dep) * disc_step_dep,
-            round(free_val / disc_step_free) * disc_step_free,
+            q(z1, max(100, self.step_zb1 // 2)),
+            q(z2, max(100, self.step_zb2 // 4)),
+            q(d, max(100, self.step_dep // 2)),
+            q(f, 100),
         )
 
-    def _generate_controls_for_state(self, zb1_val: float, zb2_val: float,
-                                     dep_val: float, free_val: float) -> List[Tuple]:
+    def _apply_control(self, state: State, u: Control) -> State | None:
+        z1, z2, d, f = state
+        dz1, dz2, dd = u
+
+        if dz1 % self.step_zb1 != 0 or dz2 % self.step_zb2 != 0 or dd % self.step_dep != 0:
+            return None
+
+        nz1, nz2, nd = z1 + dz1, z2 + dz2, d + dd
+        if nz1 < self.min_zb1 or nz2 < self.min_zb2 or nd < self.min_dep:
+            return None
+
+        comm = self._commission(dz1, dz2, dd)
+        nf = f - dz1 - dz2 - dd - comm
+        if nf < 0:
+            return None
+
+        return self._quantize((nz1, nz2, nd, nf))
+
+    def _apply_situation(self, state: State, s: Dict) -> State:
+        z1, z2, d, f = state
+        return self._quantize((
+            (z1 * s["zb1"]) // 100,
+            (z2 * s["zb2"]) // 100,
+            (d * s["dep"]) // 100,
+            f
+        ))
+
+    def _buy_controls(self, free: int) -> List[Control]:
+        res: List[Control] = []
+
+        max_k1 = free // self.step_zb1
+        for k1 in range(max_k1 + 1):
+            dz1 = k1 * self.step_zb1
+            cost1 = dz1 + int(round(dz1 * self.c_zb1))
+            if cost1 > free:
+                break
+
+            max_k2 = (free - cost1) // self.step_zb2
+            for k2 in range(max_k2 + 1):
+                dz2 = k2 * self.step_zb2
+                cost2 = dz2 + int(round(dz2 * self.c_zb2))
+                if cost1 + cost2 > free:
+                    break
+
+                rest = free - cost1 - cost2
+                max_kd = rest // self.step_dep
+                for kd in range(max_kd + 1):
+                    dd = kd * self.step_dep
+                    costd = dd + int(round(dd * self.c_dep))
+                    if cost1 + cost2 + costd > free:
+                        break
+
+                    res.append((dz1, dz2, dd))
+
+        return res
+
+    def _corner_sales(self, state: State) -> List[Control]:
+        z1, z2, d, _ = state
+        res: List[Control] = [(0, 0, 0)]
+
+        if z1 > self.min_zb1:
+            res.append((-(z1 - self.min_zb1), 0, 0))
+        if z2 > self.min_zb2:
+            res.append((0, -(z2 - self.min_zb2), 0))
+        if d > self.min_dep:
+            res.append((0, 0, -(d - self.min_dep)))
+
+        return res
+
+    def build_reachable(self) -> None:
+        self.reachable = {1: set(), 2: set(), 3: set(), 4: set()}
+        self.reachable[1].add(self._quantize(self.start_state))
+
+        for k in (1, 2, 3):
+            for st in self.reachable[k]:
+                _, _, _, free = st
+                controls = self._buy_controls(free) + self._corner_sales(st)
+
+                for u in controls:
+                    st_u = self._apply_control(st, u)
+                    if st_u is None:
+                        continue
+                    for sit in self.stages[k]:
+                        self.reachable[k + 1].add(self._apply_situation(st_u, sit))
+
+    def solve(self) -> None:
+        self._snap_cache.clear()
+        self.build_reachable()
+
+        self.dp = {4: {}}
+        for st in self.reachable[4]:
+            self.dp[4][st] = float(sum(st))
+
+        self.policy = {1: {}, 2: {}, 3: {}}
+
+        for k in (3, 2, 1):
+            self.dp[k] = {}
+            for st in self.reachable[k]:
+                best_val = -1e18
+                best_u: Control = (0, 0, 0)
+
+                _, _, _, free = st
+                controls = self._buy_controls(free) + self._corner_sales(st)
+
+                for u in controls:
+                    st_u = self._apply_control(st, u)
+                    if st_u is None:
+                        continue
+
+                    val = 0.0
+                    for sit in self.stages[k]:
+                        st_next = self._apply_situation(st_u, sit)
+                        val += sit["p"] * self.dp[k + 1][st_next]
+
+                    if val > best_val:
+                        best_val = val
+                        best_u = u
+
+                self.dp[k][st] = best_val
+                self.policy[k][st] = best_u
+
+    def _snap_state(self, stage: int, st: State) -> State:
         """
-        Генерирует все допустимые управления для данного состояния.
-
-        Алгоритм:
-        1. Определяем диапазоны для каждого актива в пакетах
-        2. Генерируем разумные комбинации с учетом ограничений
+        Если st отсутствует в policy[stage], выбираем ближайшее по простой метрике.
+        Это нужно только для демонстрационной траектории.
         """
-        controls = []
+        st = self._quantize(st)
+        key = (stage, st)
+        if key in self._snap_cache:
+            return self._snap_cache[key]
 
-        # Определяем диапазоны для каждого актива в пакетах
-        # Для продажи: от 0 до максимального количества (не ниже минимума)
-        max_sell_zb1 = max(0, int((zb1_val - self.zb1.min_amount) // self.zb1.step))
-        max_sell_zb2 = max(0, int((zb2_val - self.zb2.min_amount) // self.zb2.step))
-        max_sell_dep = max(0, int((dep_val - self.dep.min_amount) // self.dep.step))
+        if st in self.policy[stage]:
+            self._snap_cache[key] = st
+            return st
 
-        # Ограничиваем фактическим количеством
-        max_sell_zb1 = min(max_sell_zb1, int(zb1_val // self.zb1.step))
-        max_sell_zb2 = min(max_sell_zb2, int(zb2_val // self.zb2.step))
-        max_sell_dep = min(max_sell_dep, int(dep_val // self.dep.step))
+        candidates = list(self.policy[stage].keys())
+        if not candidates:
+            self._snap_cache[key] = st
+            return st
 
-        # Для покупки: ограничим разумными пределами
-        # Рассчитываем максимальную сумму, которую можем потратить
-        max_money = free_val
-        if max_sell_zb1 > 0:
-            max_money += max_sell_zb1 * self.zb1.step * (1 - self.zb1.commission)
-        if max_sell_zb2 > 0:
-            max_money += max_sell_zb2 * self.zb2.step * (1 - self.zb2.commission)
-        if max_sell_dep > 0:
-            max_money += max_sell_dep * self.dep.step * (1 - self.dep.commission)
+        z1, z2, d, f = st
 
-        # Максимальное количество пакетов для покупки
-        max_buy_zb1 = int(max_money // (self.zb1.step * (1 + self.zb1.commission)))
-        max_buy_zb2 = int(max_money // (self.zb2.step * (1 + self.zb2.commission)))
-        max_buy_dep = int(max_money // (self.dep.step * (1 + self.dep.commission)))
+        def dist(a: State) -> int:
+            a1, a2, ad, af = a
+            return (
+                abs(a1 - z1) // max(1, self.step_zb1) +
+                abs(a2 - z2) // max(1, self.step_zb2) +
+                abs(ad - d) // max(1, self.step_dep) +
+                abs(af - f) // 100
+            )
 
-        # Ограничим для производительности
-        MAX_PACKAGES = 20
-        max_sell_zb1 = min(max_sell_zb1, MAX_PACKAGES)
-        max_sell_zb2 = min(max_sell_zb2, MAX_PACKAGES)
-        max_sell_dep = min(max_sell_dep, MAX_PACKAGES)
-        max_buy_zb1 = min(max_buy_zb1, MAX_PACKAGES)
-        max_buy_zb2 = min(max_buy_zb2, MAX_PACKAGES)
-        max_buy_dep = min(max_buy_dep, MAX_PACKAGES)
+        best = min(candidates, key=dist)
+        self._snap_cache[key] = best
+        return best
 
-        # Генерируем ключевые стратегии (не полный перебор)
-        strategies = []
+    def simulate_expected_path(self) -> Dict:
+        self.solve()
 
-        # 1. Без изменений
-        strategies.append((0, 0, 0))
+        cur = self._quantize(self.start_state)
+        states: List[State] = [cur]
+        controls: List[Control] = []
+        commissions: List[int] = []
 
-        # 2. Только покупка одного актива (разные количества)
-        for zb1_packages in range(1, max_buy_zb1 + 1):
-            strategies.append((zb1_packages * self.zb1.step, 0, 0))
+        for k in (1, 2, 3):
+            cur_for_policy = self._snap_state(k, cur)
+            u = self.policy[k][cur_for_policy]
 
-        for zb2_packages in range(1, max_buy_zb2 + 1):
-            strategies.append((0, zb2_packages * self.zb2.step, 0))
+            controls.append(u)
+            commissions.append(self._commission(*u))
 
-        for dep_packages in range(1, max_buy_dep + 1):
-            strategies.append((0, 0, dep_packages * self.dep.step))
+            st_u = self._apply_control(cur_for_policy, u)
+            if st_u is None:
+                st_u = cur_for_policy
 
-        # 3. Только продажа одного актива
-        for zb1_packages in range(1, max_sell_zb1 + 1):
-            strategies.append((-zb1_packages * self.zb1.step, 0, 0))
+            # матожидательные коэффициенты (для печати "средней" траектории)
+            zb1_exp = sum(s["p"] * s["zb1"] for s in self.stages[k])
+            zb2_exp = sum(s["p"] * s["zb2"] for s in self.stages[k])
+            dep_exp = sum(s["p"] * s["dep"] for s in self.stages[k])
 
-        for zb2_packages in range(1, max_sell_zb2 + 1):
-            strategies.append((0, -zb2_packages * self.zb2.step, 0))
-
-        for dep_packages in range(1, max_sell_dep + 1):
-            strategies.append((0, 0, -dep_packages * self.dep.step))
-
-        # 4. Комбинированные стратегии (покупка двух активов)
-        # ЦБ1 + ЦБ2
-        for zb1_packages in range(0, min(3, max_buy_zb1) + 1):
-            zb1_change = zb1_packages * self.zb1.step
-            cost_zb1 = zb1_change * (1 + self.zb1.commission)
-
-            for zb2_packages in range(0, min(3, max_buy_zb2) + 1):
-                zb2_change = zb2_packages * self.zb2.step
-                cost_zb2 = zb2_change * (1 + self.zb2.commission)
-
-                if cost_zb1 + cost_zb2 <= free_val:
-                    strategies.append((zb1_change, zb2_change, 0))
-
-        # ЦБ1 + Депозит
-        for zb1_packages in range(0, min(3, max_buy_zb1) + 1):
-            zb1_change = zb1_packages * self.zb1.step
-            cost_zb1 = zb1_change * (1 + self.zb1.commission)
-
-            for dep_packages in range(0, min(3, max_buy_dep) + 1):
-                dep_change = dep_packages * self.dep.step
-                cost_dep = dep_change * (1 + self.dep.commission)
-
-                if cost_zb1 + cost_dep <= free_val:
-                    strategies.append((zb1_change, 0, dep_change))
-
-        # ЦБ2 + Депозит
-        for zb2_packages in range(0, min(3, max_buy_zb2) + 1):
-            zb2_change = zb2_packages * self.zb2.step
-            cost_zb2 = zb2_change * (1 + self.zb2.commission)
-
-            for dep_packages in range(0, min(3, max_buy_dep) + 1):
-                dep_change = dep_packages * self.dep.step
-                cost_dep = dep_change * (1 + self.dep.commission)
-
-                if cost_zb2 + cost_dep <= free_val:
-                    strategies.append((0, zb2_change, dep_change))
-
-        # Фильтруем по допустимости
-        valid_controls = []
-        for control in strategies:
-            delta_zb1, delta_zb2, delta_dep = control
-
-            # Проверяем кратность шагам
-            if (not self.zb1.is_change_valid(delta_zb1) or
-                    not self.zb2.is_change_valid(delta_zb2) or
-                    not self.dep.is_change_valid(delta_dep)):
-                continue
-
-            # Рассчитываем комиссию
-            commission = self._calculate_total_commission(delta_zb1, delta_zb2, delta_dep)
-
-            # Новые значения
-            new_zb1 = zb1_val + delta_zb1
-            new_zb2 = zb2_val + delta_zb2
-            new_dep = dep_val + delta_dep
-            new_free = free_val - (delta_zb1 + delta_zb2 + delta_dep) - commission
-
-            # Проверяем ограничения
-            if (new_zb1 < self.zb1.min_amount - 1e-10 or
-                    new_zb2 < self.zb2.min_amount - 1e-10 or
-                    new_dep < self.dep.min_amount - 1e-10 or
-                    new_free < -1e-10):
-                continue
-
-            valid_controls.append(control)
-
-        return valid_controls
-
-    @lru_cache(maxsize=20000)
-    def _bellman_value(self, zb1_val: float, zb2_val: float, dep_val: float,
-                       free_val: float, stage: int) -> Tuple[float, Tuple]:
-        """
-        Рекурсивная функция, реализующая рекуррентное соотношение Беллмана.
-        Возвращает максимальное ожидаемое значение и оптимальное управление.
-
-        Используется декоратор @lru_cache для кэширования результатов.
-        """
-        # Дискретизируем состояние для кэширования
-        disc_state = self._discretize_state(zb1_val, zb2_val, dep_val, free_val)
-        zb1_disc, zb2_disc, dep_disc, free_disc = disc_state
-
-        # Базовый случай: после последнего этапа
-        if stage > 3:
-            # В базовом случае используем реальные значения, а не дискретизированные
-            total_value = zb1_val + zb2_val + dep_val + free_val
-            return total_value, (0, 0, 0)
-
-        # Генерируем допустимые управления
-        controls = self._generate_controls_for_state(zb1_disc, zb2_disc, dep_disc, free_disc)
-
-        best_value = -float('inf')
-        best_control = (0, 0, 0)
-
-        # Для каждого управления вычисляем ожидаемое значение
-        for control in controls:
-            delta_zb1, delta_zb2, delta_dep = control
-
-            # Рассчитываем комиссию
-            commission = self._calculate_total_commission(delta_zb1, delta_zb2, delta_dep)
-
-            # Применяем управление
-            new_zb1 = zb1_val + delta_zb1
-            new_zb2 = zb2_val + delta_zb2
-            new_dep = dep_val + delta_dep
-            new_free = free_val - (delta_zb1 + delta_zb2 + delta_dep) - commission
-
-            # Вычисляем математическое ожидание по всем ситуациям
-            expected_value = 0.0
-
-            for situation in self.stages[stage].values():
-                # Вероятность ситуации
-                probability = situation['p']
-
-                # Применяем коэффициенты роста
-                zb1_after = new_zb1 * situation['zb1']
-                zb2_after = new_zb2 * situation['zb2']
-                dep_after = new_dep * situation['dep']
-
-                # Рекурсивный вызов для следующего этапа
-                future_value, _ = self._bellman_value(zb1_after, zb2_after, dep_after,
-                                                      new_free, stage + 1)
-
-                # Добавляем вклад этой ситуации
-                expected_value += probability * future_value
-
-            # Обновляем лучшее значение
-            if expected_value > best_value:
-                best_value = expected_value
-                best_control = control
-
-        return best_value, best_control
-
-    def find_optimal_strategy(self) -> Dict:
-        """
-        Находит оптимальную стратегию с помощью обратного хода Беллмана.
-
-        Returns:
-            Словарь с информацией об оптимальной стратегии
-        """
-        # Очищаем кэш перед вычислением
-        self._bellman_value.cache_clear()
-
-        # Выполняем обратный ход из начального состояния
-        optimal_value, first_control = self._bellman_value(
-            self.zb1.current_amount,
-            self.zb2.current_amount,
-            self.dep.current_amount,
-            self.free_cash,
-            1
-        )
-
-        # Собираем информацию о кэше
-        cache_info = self._bellman_value.cache_info()
+            z1, z2, d, f = st_u
+            cur = self._quantize((
+                int((z1 * zb1_exp) // 100),
+                int((z2 * zb2_exp) // 100),
+                int((d * dep_exp) // 100),
+                f
+            ))
+            states.append(cur)
 
         return {
-            'optimal_value': optimal_value,
-            'first_control': first_control,
-            'cache_info': cache_info
-        }
-
-    def simulate_optimal_path(self) -> Dict:
-        """
-        Симулирует оптимальный путь для математического ожидания ситуаций.
-
-        Returns:
-            Словарь с историей состояний, управлений и комиссий
-        """
-        # Получаем оптимальную стратегию
-        result = self.find_optimal_strategy()
-        optimal_value = result['optimal_value']
-
-        # Восстанавливаем оптимальный путь
-        states = []
-        controls = []
-        commissions = []
-
-        # Начальное состояние
-        current_state = {
-            'zb1': self.zb1.current_amount,
-            'zb2': self.zb2.current_amount,
-            'dep': self.dep.current_amount,
-            'free': self.free_cash
-        }
-        states.append(current_state.copy())
-
-        # Для каждого этапа
-        for stage in range(1, 4):
-            # Получаем оптимальное управление для текущего состояния
-            if stage == 1:
-                control = result['first_control']
-            else:
-                # Вычисляем оптимальное управление для текущего состояния
-                _, control = self._bellman_value(
-                    current_state['zb1'],
-                    current_state['zb2'],
-                    current_state['dep'],
-                    current_state['free'],
-                    stage
-                )
-
-            controls.append(control)
-
-            # Рассчитываем комиссию
-            delta_zb1, delta_zb2, delta_dep = control
-            commission = self._calculate_total_commission(delta_zb1, delta_zb2, delta_dep)
-            commissions.append(commission)
-
-            # Применяем управление
-            current_state['zb1'] += delta_zb1
-            current_state['zb2'] += delta_zb2
-            current_state['dep'] += delta_dep
-            current_state['free'] -= (delta_zb1 + delta_zb2 + delta_dep) + commission
-
-            # Применяем математическое ожидание ситуаций
-            # Рассчитываем ожидаемые коэффициенты роста
-            expected_growth = {
-                'zb1': sum(s['zb1'] * s['p'] for s in self.stages[stage].values()),
-                'zb2': sum(s['zb2'] * s['p'] for s in self.stages[stage].values()),
-                'dep': sum(s['dep'] * s['p'] for s in self.stages[stage].values()),
-            }
-
-            current_state['zb1'] *= expected_growth['zb1']
-            current_state['zb2'] *= expected_growth['zb2']
-            current_state['dep'] *= expected_growth['dep']
-
-            states.append(current_state.copy())
-
-        # Финальное значение
-        final_value = (current_state['zb1'] + current_state['zb2'] +
-                       current_state['dep'] + current_state['free'])
-
-        return {
-            'optimal_expected_value': optimal_value,
-            'final_expected_value': final_value,
-            'states': states,
-            'controls': controls,
-            'commissions': commissions,
-            'cache_info': result['cache_info']
+            "states": [(a / 100, b / 100, c / 100, f / 100) for a, b, c, f in states],
+            "controls": [(u1 / 100, u2 / 100, ud / 100) for u1, u2, ud in controls],
+            "commissions": [x / 100 for x in commissions],
+            "final_value": sum(states[-1]) / 100
         }
